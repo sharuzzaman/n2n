@@ -1,5 +1,5 @@
 /**
- * (C) 2007-18 - ntop.org and contributors
+ * (C) 2007-20 - ntop.org and contributors
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,13 +16,9 @@
  *
  */
 
-#include "n2n.h"
-
 #ifdef __linux__
 
-#include <net/if_arp.h>
-#include <linux/netlink.h>
-#include <linux/rtnetlink.h>
+#include "n2n.h"
 
 /* ********************************** */
 
@@ -150,7 +146,7 @@ int tuntap_open(tuntap_dev *device,
     int i;
 
     for(i = 0; i < 6; i++)
-      device->mac_addr[i] = rand();
+      device->mac_addr[i] = n2n_rand();
 
     device->mac_addr[0] &= ~0x01; /* Clear multicast bit */
     device->mac_addr[0] |= 0x02;  /* Set locally-assigned bit */
@@ -170,6 +166,7 @@ int tuntap_open(tuntap_dev *device,
   sa.nl_groups = RTMGRP_LINK;
   sa.nl_pid = getpid();
 
+  memset(&msg, 0, sizeof(msg));
   msg.msg_name = &sa;
   msg.msg_namelen = sizeof(sa);
   msg.msg_iov = &iov;
@@ -229,6 +226,8 @@ int tuntap_open(tuntap_dev *device,
 
   device->ip_addr = inet_addr(device_ip);
   device->device_mask = inet_addr(device_mask);
+  device->if_idx = if_nametoindex(dev);
+
   return(device->fd);
 }
 

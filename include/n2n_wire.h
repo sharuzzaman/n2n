@@ -1,5 +1,5 @@
 /**
- * (C) 2007-18 - ntop.org and contributors
+ * (C) 2007-20 - ntop.org and contributors
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -137,6 +137,7 @@ typedef struct n2n_PACKET
     n2n_mac_t           dstMac;
     n2n_sock_t          sock;
     uint16_t            transform;
+    uint16_t		compression;
 } n2n_PACKET_t;
 
 /* Linked with n2n_register_super in n2n_pc_t. Only from edge to supernode. */
