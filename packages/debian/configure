@@ -583,11 +583,13 @@ PACKAGE_URL=''
 
 ac_subst_vars='LTLIBOBJS
 LIBOBJS
-N2N_VERSION_SHORT
-GIT_COMMITS
+EXTRA_DEP
 DATE
 EXTN
+GIT_COMMITS
+N2N_VERSION_SHORT
 MACHINE
+BUILDPACKAGE_EXTRA
 APP
 target_alias
 host_alias
@@ -631,6 +633,7 @@ SHELL'
 ac_subst_files=''
 ac_user_opts='
 enable_option_checking
+with_edgex
 '
       ac_precious_vars='build_alias
 host_alias
@@ -1251,6 +1254,11 @@ if test -n "$ac_init_help"; then
    esac
   cat <<\_ACEOF
 
+Optional Packages:
+  --with-PACKAGE[=ARG]    use PACKAGE [ARG=yes]
+  --without-PACKAGE       do not use PACKAGE (same as --with-PACKAGE=no)
+  --with-edgex            Build for Ubiquity-X
+
 Report bugs to the package provider.
 _ACEOF
 ac_status=$?
@@ -1680,8 +1688,28 @@ ac_compiler_gnu=$ac_cv_c_compiler_gnu
 
 
 
+
+# Check whether --with-edgex was given.
+if test "${with_edgex+set}" = set; then :
+  withval=$with_edgex;
+fi
+
+
+# NOTE: this file is not actually used. You need to edit configure as well!
+N2N_VERSION_SHORT=`grep N2N_VERSION_SHORT ../../Makefile | head -1| cut -d "=" -f 2`
+GIT_COMMITS=`grep GIT_COMMITS ../../Makefile | head -1| cut -d "=" -f 2`
+
 MACHINE=`uname -m`
 SHORT_MACHINE=`uname -m | cut -b1-3`
+
+DEBIAN_VERSION=`cat /etc/debian_version | grep "^8" | wc -l`
+
+EXTRA_DEP=""
+if test $DEBIAN_VERSION = "0"; then
+EXTRA_DEP=", libzstd1"
+fi
+
+BUILDPACKAGE_EXTRA=
 
 if test $MACHINE = "x86_64"; then
    EXTN="amd64"
@@ -1704,10 +1732,15 @@ else
   fi
 fi
 
+if test "${with_edgex+set}" = set; then
+    EXTN="mipsel"
+    EXTRA_DEPS=""
+    BUILDPACKAGE_EXTRA="--host-arch mipsel"
+fi
+
 APP=n2n
-N2N_VERSION_SHORT=`grep N2N_VERSION_SHORT ../../Makefile | head -1| cut -d "=" -f 2`
-GIT_COMMITS=`grep GIT_COMMITS ../../Makefile | head -1| cut -d "=" -f 2`
 DATE=`date -R`
+
 
 
 

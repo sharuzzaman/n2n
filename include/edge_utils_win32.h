@@ -1,5 +1,5 @@
 /**
- * (C) 2007-20 - ntop.org and contributors
+ * (C) 2007-21 - ntop.org and contributors
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -8,7 +8,7 @@
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
@@ -16,19 +16,37 @@
  *
  */
 
+#ifndef _EDGE_UTILS_WIN32_H_
+#define _EDGE_UTILS_WIN32_H_
+
 #ifdef WIN32
 
+#define WIN32_LEAN_AND_MEAN
+
 #include <process.h>
+#include <n2n.h>
+#include <winsock2.h>
+#include <iphlpapi.h>
+
 
 /* Multicast peers discovery disabled due to https://github.com/ntop/n2n/issues/65 */
-#define SKIP_MULTICAST_PEERS_DISCOVERY
+
+/* Currently, multicast is performed by specifying the default routing network adapter.
+ * If the solution is determined to be stable and effective,
+ * all macro definitions "SKIP_MULTICAST_PEERS_DISCOVERY" will be completely deleted in the future.
+ */
+//#define SKIP_MULTICAST_PEERS_DISCOVERY
 
 struct tunread_arg {
-  n2n_edge_t *eee;
-  int *keep_running;
+    n2n_edge_t *eee;
+    int *keep_running;
 };
 
-extern HANDLE startTunReadThread(struct tunread_arg *arg);
+extern HANDLE startTunReadThread (struct tunread_arg *arg);
+int get_best_interface_ip(n2n_edge_t * eee, dec_ip_str_t ip_addr);
 
-#endif
+
+#endif /* WIN32 */
+
+#endif /* _EDGE_UTILS_WIN32_H_ */
 

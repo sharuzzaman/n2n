@@ -9,7 +9,10 @@ Source: n2n-%{version}.tgz
 Packager: Luca Deri <deri@ntop.org>
 # Temporary location where the RPM will be built
 BuildRoot:  %{_tmppath}/%{name}-%{version}-root
-#Requires: ntopng
+Requires: libzstd
+
+# Make sure .build-id is not part of the package
+%define _build_id_links none
 
 %description
 n2n peer-to-peer VPN
@@ -80,19 +83,25 @@ if ! /usr/bin/id -u n2n > /dev/null 2>&1; then
 fi
 
 %post
-if [ ! -f /.dockerenv ]; then
-    /bin/systemctl daemon-reload
-    # NOTE: do not enable any services during first installation
+if [ -f /bin/systemctl ]; then
+  if [ ! -f /.dockerenv ]; then
+      /bin/systemctl daemon-reload
+      # NOTE: do not enable any services during first installation
+  fi
 fi
 
 %preun
-if [ ! -f /.dockerenv ]; then
-    # possibly remove the installed services
-    %systemd_preun supernode.service edge.service 'edge-ntopng@*.service' 'edge@*.service'
+if [ -f /bin/systemctl ]; then
+  if [ ! -f /.dockerenv ]; then
+      # possibly remove the installed services
+      %systemd_preun supernode.service edge.service 'edge-ntopng@*.service' 'edge@*.service'
+  fi
 fi
 
 %postun
-if [ ! -f /.dockerenv ]; then
-    # possibly restart the running services
-    %systemd_postun_with_restart supernode.service edge.service 'edge-ntopng@*.service' 'edge@*.service'
+if [ -f /bin/systemctl ]; then
+  if [ ! -f /.dockerenv ]; then
+      # possibly restart the running services
+      %systemd_postun_with_restart supernode.service edge.service 'edge-ntopng@*.service' 'edge@*.service'
+  fi
 fi

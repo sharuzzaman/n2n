@@ -1,13 +1,13 @@
 #
-# Copyright (C) 2019 - ntop.org and contributors
+# Copyright (C) 2021 - ntop.org and contributors
 #
 
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=n2n
 PKG_SOURCE_URL:=https://github.com/ntop/n2n.git
-PKG_SOURCE_VERSION:=fa695e9f2b5eae2523ef6c055a579006ac0bf146
-PKG_VERSION:=2.5.1_git$(PKG_SOURCE_VERSION)
+PKG_SOURCE_VERSION:=53e930db105df0e1103d8b6de9d5cb223c744d49
+PKG_VERSION:=2.9.0_dev_git$(PKG_SOURCE_VERSION)
 PKG_RELEASE:=1
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
@@ -56,7 +56,7 @@ define Build/Configure
 endef
 
 define Package/n2n-edge/conffiles
-/etc/config/n2n-edge.conf
+/etc/n2n/edge.conf
 endef
 
 define Package/n2n-edge/install
@@ -64,12 +64,12 @@ define Package/n2n-edge/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/edge $(1)/usr/bin/
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/packages/openwrt/etc/init.d/edge $(1)/etc/init.d/edge
-	$(INSTALL_DIR) $(1)/etc/config
-	$(INSTALL_CONF) $(PKG_BUILD_DIR)/packages/etc/n2n/edge.conf.sample $(1)/etc/config/n2n-edge.conf
+	$(INSTALL_DIR) $(1)/etc/n2n
+	$(INSTALL_CONF) $(PKG_BUILD_DIR)/packages/etc/n2n/edge.conf.sample $(1)/etc/n2n/edge.conf
 endef
 
 define Package/n2n-supernode/conffiles
-/etc/config/n2n-supernode.conf
+/etc/n2n/supernode.conf
 endef
 
 define Package/n2n-supernode/install
@@ -77,8 +77,8 @@ define Package/n2n-supernode/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/supernode $(1)/usr/bin/
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/packages/openwrt/etc/init.d/supernode $(1)/etc/init.d/supernode
-	$(INSTALL_DIR) $(1)/etc/config
-	$(INSTALL_CONF) $(PKG_BUILD_DIR)/packages/etc/n2n/supernode.conf.sample $(1)/etc/config/n2n-supernode.conf
+	$(INSTALL_DIR) $(1)/etc/n2n
+	$(INSTALL_CONF) $(PKG_BUILD_DIR)/packages/etc/n2n/supernode.conf.sample $(1)/etc/n2n/supernode.conf
 endef
 
 $(eval $(call BuildPackage,n2n-edge))

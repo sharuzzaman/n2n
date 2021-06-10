@@ -1,5 +1,5 @@
 /**
- * (C) 2019 - ntop.org and contributors
+ * (C) 2019-21 - ntop.org and contributors
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -44,7 +44,7 @@ static void help() {
   fprintf(stderr, "-c <community>           | Specify the community.\n");
   fprintf(stderr, "-k <key>                 | Specify the encryption key.\n");
 #ifdef N2N_HAVE_AES
-  fprintf(stderr, "-A                       | Use AES CBC decryption (default=use twofish).\n");
+  fprintf(stderr, "-A                       | Use AES decryption (default=use twofish).\n");
 #endif
   fprintf(stderr, "-B <bpf>                 | Use set a BPF filter for the capture.\n");
   fprintf(stderr, "-w <fname>               | Write decoded PCAP to file.\n");
@@ -103,7 +103,7 @@ static int decode_encrypted_packet(const u_char *packet, struct pcap_pkthdr *hea
       return(-1);
     }
     break;
-  case N2N_TRANSFORM_ID_AESCBC:
+  case N2N_TRANSFORM_ID_AES:
     if(!aes_mode) {
       traceEvent(TRACE_INFO, "Skipping AES encrypted packet");
       return(-1);
@@ -280,10 +280,10 @@ int main(int argc, char* argv[]) {
 
 #ifdef N2N_HAVE_AES
   if(aes_mode)
-    n2n_transop_aes_cbc_init(&conf, &transop);
+    n2n_transop_aes_init(&conf, &transop);
   else
 #endif
-    n2n_transop_twofish_init(&conf, &transop);
+    n2n_transop_tf_init(&conf, &transop);
 
   if((handle = pcap_create(ifname, errbuf)) == NULL) {
     traceEvent(TRACE_ERROR, "Cannot open device %s: %s", ifname, errbuf);

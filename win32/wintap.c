@@ -2,7 +2,7 @@
   (C) 2007-09 - Luca Deri <deri@ntop.org>
 */
 
-#include "../n2n.h"
+#include "n2n.h"
 #include "n2n_win32.h"
 
 /* ***************************************************** */
@@ -18,6 +18,11 @@ void initWin32() {
     printf("FATAL ERROR: unable to initialise Winsock 2.x.");
     exit(EXIT_FAILURE);
   }
+}
+
+
+void destroyWin32() {
+	WSACleanup();
 }
 
 struct win_adapter_info {
@@ -98,7 +103,7 @@ static void iterate_win_network_adapters(
 /* ***************************************************** */
 
 static int print_adapter_callback(struct win_adapter_info *adapter, struct tuntap_dev *device) {
-  printf("  %s - %s\n", adapter->adapterid, adapter->adaptername);
+  printf(" %s - %s\n", adapter->adapterid, adapter->adaptername);
 
   /* continue */
   return(1);
@@ -223,7 +228,9 @@ int open_wintap(struct tuntap_dev *device,
                 char *device_ip, 
                 char *device_mask,
                 const char *device_mac, 
-                int mtu) {
+                int mtu,
+                int metric) {
+
   char cmd[256];
   DWORD len;
   ULONG status = TRUE;
@@ -241,7 +248,7 @@ int open_wintap(struct tuntap_dev *device,
       printf("No Windows tap devices found, did you run tapinstall.exe?\n");
     else
       printf("Cannot find tap device \"%s\"\n", devname);
-    exit(EXIT_FAILURE);
+    return -1;
   }
 
   /* ************************************** */
@@ -295,13 +302,33 @@ int open_wintap(struct tuntap_dev *device,
   /* ****************** */
 
   /* MTU */
+
   _snprintf(cmd, sizeof(cmd),
     "netsh interface ipv4 set subinterface \"%s\" mtu=%d store=persistent > nul",
     device->ifName, mtu);
 
   if(system(cmd) != 0)
-    printf("WARNING: Unable to set device %s MTU [%s]\n",
-      device->ifName, cmd);
+    printf("WARNING: Unable to set device %s parameters MTU=%d store=persistent [%s]\n",
+      device->ifName, mtu, cmd);
+
+  /* ****************** */
+
+  /* metric */
+
+  if(metric) { /* try to change only if a value has been given, otherwise leave with default or as set before */
+    device->metric = metric;
+
+    _snprintf(cmd, sizeof(cmd),
+      "netsh interface ipv4 set interface \"%s\" metric=%d > nul",
+      device->ifName, device->metric);
+
+    if(system(cmd) != 0)
+      printf("WARNING: Unable to set device %s parameters metric=%d [%s]\n",
+        device->ifName, device->metric, cmd);
+  }
+
+  /* ****************** */
+
 
   /* set driver media status to 'connected' (i.e. set the interface up) */
   if (!DeviceIoControl (device->device_handle, TAP_IOCTL_SET_MEDIA_STATUS,
@@ -384,8 +411,9 @@ int tuntap_open(struct tuntap_dev *device,
                 char *device_ip, 
                 char *device_mask, 
                 const char * device_mac, 
-                int mtu) {
-    return(open_wintap(device, dev, address_mode, device_ip, device_mask, device_mac, mtu));
+                int mtu,
+                int metric) {
+    return(open_wintap(device, dev, address_mode, device_ip, device_mask, device_mac, mtu, metric));
 }
 
 /* ************************************************ */
@@ -410,7 +438,7 @@ int main(int argc, char* argv[]) {
 
   printf("Welcome to n2n\n");
   initWin32();
-  open_wintap(&tuntap, "static", "1.2.3.20", "255.255.255.0", mtu);
+  open_wintap(&tuntap, "static", "1.2.3.20", "255.255.255.0", mtu, 0);
 
   for(i=0; i<10; i++) {
     u_char buf[MTU];

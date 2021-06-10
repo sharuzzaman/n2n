@@ -1,5 +1,5 @@
 /**
- * (C) 2007-20 - ntop.org and contributors
+ * (C) 2007-21 - ntop.org and contributors
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -8,7 +8,7 @@
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
@@ -21,991 +21,676 @@
 #include "n2n.h"
 #include "header_encryption.h"
 
-#ifdef WIN32
-#include <signal.h>
-#endif
-
-#define N2N_SN_LPORT_DEFAULT 7654
-#define N2N_SN_PKTBUF_SIZE   2048
-
-#define N2N_SN_MGMT_PORT                5645
-
-#define HASH_FIND_COMMUNITY(head,name,out) HASH_FIND_STR(head,name,out)
-
-static int try_forward(n2n_sn_t * sss,
-		       const struct sn_community *comm,
-		       const n2n_common_t * cmn,
-		       const n2n_mac_t dstMac,
-		       const uint8_t * pktbuf,
-		       size_t pktsize);
-
-static int try_broadcast(n2n_sn_t * sss,
-		         const struct sn_community *comm,
-			 const n2n_common_t * cmn,
-			 const n2n_mac_t srcMac,
-			 const uint8_t * pktbuf,
-			 size_t pktsize);
+#define HASH_FIND_COMMUNITY(head, name, out) HASH_FIND_STR(head, name, out)
 
 static n2n_sn_t sss_node;
 
-/** Initialise the supernode structure */
-static int init_sn(n2n_sn_t * sss) {
-#ifdef WIN32
-  initWin32();
-#endif
-  memset(sss, 0, sizeof(n2n_sn_t));
-
-  sss->daemon = 1; /* By defult run as a daemon. */
-  sss->lport = N2N_SN_LPORT_DEFAULT;
-  sss->sock = -1;
-  sss->mgmt_sock = -1;
-
-  return 0; /* OK */
-}
-
-/** Deinitialise the supernode structure and deallocate any memory owned by
- *  it. */
-static void deinit_sn(n2n_sn_t * sss)
-{
-  struct sn_community *community, *tmp;
-
-  if(sss->sock >= 0)
-    {
-      closesocket(sss->sock);
-    }
-  sss->sock=-1;
-
-  if(sss->mgmt_sock >= 0)
-    {
-      closesocket(sss->mgmt_sock);
-    }
-  sss->mgmt_sock=-1;
-
-  HASH_ITER(hh, sss->communities, community, tmp) {
-    clear_peer_list(&community->edges);
-    if (NULL != community->header_encryption_ctx)
-      free (community->header_encryption_ctx);
-    HASH_DEL(sss->communities, community);
-    free(community);
-  }
-}
-
-
-/** Determine the appropriate lifetime for new registrations.
- *
- *  If the supernode has been put into a pre-shutdown phase then this lifetime
- *  should not allow registrations to continue beyond the shutdown point.
- */
-static uint16_t reg_lifetime(n2n_sn_t * sss) {
-  /* NOTE: UDP firewalls usually have a 30 seconds timeout */
-  return 15;
-}
-
-
-/** Update the edge table with the details of the edge which contacted the
- *  supernode. */
-static int update_edge(n2n_sn_t * sss,
-		       const n2n_mac_t edgeMac,
-		       struct sn_community *comm,
-		       const n2n_sock_t * sender_sock,
-		       time_t now) {
-  macstr_t            mac_buf;
-  n2n_sock_str_t      sockbuf;
-  struct peer_info *  scan;
-
-  traceEvent(TRACE_DEBUG, "update_edge for %s [%s]",
-	     macaddr_str(mac_buf, edgeMac),
-	     sock_to_cstr(sockbuf, sender_sock));
-
-  HASH_FIND_PEER(comm->edges, edgeMac, scan);
-
-  if(NULL == scan) {
-      /* Not known */
-
-      scan = (struct peer_info*)calloc(1, sizeof(struct peer_info)); /* deallocated in purge_expired_registrations */
-
-      memcpy(&(scan->mac_addr), edgeMac, sizeof(n2n_mac_t));
-      memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
-
-      HASH_ADD_PEER(comm->edges, scan);
-
-      traceEvent(TRACE_INFO, "update_edge created   %s ==> %s",
-		 macaddr_str(mac_buf, edgeMac),
-		 sock_to_cstr(sockbuf, sender_sock));
-    } else  {
-      /* Known */
-      if(!sock_equal(sender_sock, &(scan->sock))) {
-	  memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
-
-	  traceEvent(TRACE_INFO, "update_edge updated   %s ==> %s",
-		     macaddr_str(mac_buf, edgeMac),
-		     sock_to_cstr(sockbuf, sender_sock));
-        }
-      else
-        {
-	  traceEvent(TRACE_DEBUG, "update_edge unchanged %s ==> %s",
-		     macaddr_str(mac_buf, edgeMac),
-		     sock_to_cstr(sockbuf, sender_sock));
-        }
-
-    }
-
-  scan->last_seen = now;
-  return 0;
-}
-
-
-/** Send a datagram to the destination embodied in a n2n_sock_t.
- *
- *  @return -1 on error otherwise number of bytes sent
- */
-static ssize_t sendto_sock(n2n_sn_t * sss,
-                           const n2n_sock_t * sock,
-                           const uint8_t * pktbuf,
-                           size_t pktsize)
-{
-  n2n_sock_str_t      sockbuf;
-
-  if(AF_INET == sock->family)
-    {
-      struct sockaddr_in udpsock;
-
-      udpsock.sin_family = AF_INET;
-      udpsock.sin_port = htons(sock->port);
-      memcpy(&(udpsock.sin_addr.s_addr), &(sock->addr.v4), IPV4_SIZE);
-
-      traceEvent(TRACE_DEBUG, "sendto_sock %lu to [%s]",
-		 pktsize,
-		 sock_to_cstr(sockbuf, sock));
-
-      return sendto(sss->sock, pktbuf, pktsize, 0,
-		    (const struct sockaddr *)&udpsock, sizeof(struct sockaddr_in));
-    }
-  else
-    {
-      /* AF_INET6 not implemented */
-      errno = EAFNOSUPPORT;
-      return -1;
-    }
-}
-
-static int try_forward(n2n_sn_t * sss,
-		       const struct sn_community *comm,
-		       const n2n_common_t * cmn,
-		       const n2n_mac_t dstMac,
-		       const uint8_t * pktbuf,
-		       size_t pktsize)
-{
-  struct peer_info *  scan;
-  macstr_t            mac_buf;
-  n2n_sock_str_t      sockbuf;
-
-  HASH_FIND_PEER(comm->edges, dstMac, scan);
-
-  if(NULL != scan)
-    {
-      int data_sent_len;
-      data_sent_len = sendto_sock(sss, &(scan->sock), pktbuf, pktsize);
-
-      if(data_sent_len == pktsize)
-        {
-	  ++(sss->stats.fwd);
-	  traceEvent(TRACE_DEBUG, "unicast %lu to [%s] %s",
-		     pktsize,
-		     sock_to_cstr(sockbuf, &(scan->sock)),
-		     macaddr_str(mac_buf, scan->mac_addr));
-        }
-      else
-        {
-	  ++(sss->stats.errors);
-	  traceEvent(TRACE_ERROR, "unicast %lu to [%s] %s FAILED (%d: %s)",
-		     pktsize,
-		     sock_to_cstr(sockbuf, &(scan->sock)),
-		     macaddr_str(mac_buf, scan->mac_addr),
-		     errno, strerror(errno));
-        }
-    }
-  else
-    {
-      traceEvent(TRACE_DEBUG, "try_forward unknown MAC");
-
-      /* Not a known MAC so drop. */
-      return(-2);
-    }
-
-  return(0);
-}
-
-
-/** Try and broadcast a message to all edges in the community.
- *
- *  This will send the exact same datagram to zero or more edges registered to
- *  the supernode.
- */
-static int try_broadcast(n2n_sn_t * sss,
-                         const struct sn_community *comm,
-			 const n2n_common_t * cmn,
-			 const n2n_mac_t srcMac,
-			 const uint8_t * pktbuf,
-			 size_t pktsize)
-{
-  struct peer_info *scan, *tmp;
-  macstr_t            mac_buf;
-  n2n_sock_str_t      sockbuf;
-
-  traceEvent(TRACE_DEBUG, "try_broadcast");
-
-  HASH_ITER(hh, comm->edges, scan, tmp) {
-    if(memcmp(srcMac, scan->mac_addr, sizeof(n2n_mac_t)) != 0) {
-      /* REVISIT: exclude if the destination socket is where the packet came from. */
-      int data_sent_len;
-
-      data_sent_len = sendto_sock(sss, &(scan->sock), pktbuf, pktsize);
-
-      if(data_sent_len != pktsize)
-      {
-        ++(sss->stats.errors);
-        traceEvent(TRACE_WARNING, "multicast %lu to [%s] %s failed %s",
-  		   pktsize,
-		   sock_to_cstr(sockbuf, &(scan->sock)),
-		   macaddr_str(mac_buf, scan->mac_addr),
-		   strerror(errno));
-      }
-      else
-      {
-        ++(sss->stats.broadcast);
-        traceEvent(TRACE_DEBUG, "multicast %lu to [%s] %s",
-	           pktsize,
-		   sock_to_cstr(sockbuf, &(scan->sock)),
-		   macaddr_str(mac_buf, scan->mac_addr));
-      }
-    }
-  }
-  return 0;
-}
-
-
-static int process_mgmt(n2n_sn_t * sss,
-			const struct sockaddr_in * sender_sock,
-			const uint8_t * mgmt_buf,
-			size_t mgmt_size,
-			time_t now)
-{
-  char resbuf[N2N_SN_PKTBUF_SIZE];
-  size_t ressize=0;
-  uint32_t num_edges=0;
-  ssize_t r;
-  struct sn_community *community, *tmp;
-
-  traceEvent(TRACE_DEBUG, "process_mgmt");
-
-  ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-		      "----------------\n");
-
-  ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-		      "uptime    %lu\n", (now - sss->start_time));
-
-  HASH_ITER(hh, sss->communities, community, tmp) {
-    num_edges += HASH_COUNT(community->edges);
-  }
-
-  ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-		      "edges     %u\n",
-		      num_edges);
-
-  ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-		      "errors    %u\n",
-		      (unsigned int)sss->stats.errors);
-
-  ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-		      "reg_sup   %u\n",
-		      (unsigned int)sss->stats.reg_super);
-
-  ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-		      "reg_nak   %u\n",
-		      (unsigned int)sss->stats.reg_super_nak);
-
-  ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-		      "fwd       %u\n",
-		      (unsigned int) sss->stats.fwd);
-
-  ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-		      "broadcast %u\n",
-		      (unsigned int) sss->stats.broadcast);
-
-  ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-		      "last fwd  %lu sec ago\n",
-		      (long unsigned int)(now - sss->stats.last_fwd));
-
-  ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-		      "last reg  %lu sec ago\n",
-		      (long unsigned int) (now - sss->stats.last_reg_super));
-
-  ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-                      "cur_cmnts");
-  HASH_ITER(hh, sss->communities, community, tmp) {
-    ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-                        " [%s]",
-                        community->community);
-  }
-  ressize += snprintf(resbuf+ressize, N2N_SN_PKTBUF_SIZE-ressize,
-                      "\n");
-
-
-  r = sendto(sss->mgmt_sock, resbuf, ressize, 0/*flags*/,
-	     (struct sockaddr *)sender_sock, sizeof(struct sockaddr_in));
-
-  if(r <= 0)
-    {
-      ++(sss->stats.errors);
-      traceEvent(TRACE_ERROR, "process_mgmt : sendto failed. %s", strerror(errno));
-    }
-
-  return 0;
-}
+int resolve_create_thread (n2n_resolve_parameter_t **param, struct peer_info *sn_list);
 
 /** Load the list of allowed communities. Existing/previous ones will be removed
  *
  */
-static int load_allowed_sn_community(n2n_sn_t *sss, char *path) {
-  char buffer[4096], *line;
-  FILE *fd = fopen(path, "r");
-  struct sn_community *s, *tmp;
-  uint32_t num_communities = 0;
+static int load_allowed_sn_community (n2n_sn_t *sss) {
 
-  if(fd == NULL) {
-    traceEvent(TRACE_WARNING, "File %s not found", path);
-    return -1;
-  }
+    char buffer[4096], *line, *cmn_str, net_str[20], format[20];
 
-  HASH_ITER(hh, sss->communities, s, tmp) {
-    HASH_DEL(sss->communities, s);
-    if (NULL != s->header_encryption_ctx)
-      free (s->header_encryption_ctx);
-    free(s);
-  }
+    sn_user_t *user, *tmp_user;
+    n2n_desc_t username;
+    n2n_private_public_key_t public_key;
+    uint8_t ascii_public_key[(N2N_PRIVATE_PUBLIC_KEY_SIZE * 8 + 5) / 6 + 1];
 
-  while((line = fgets(buffer, sizeof(buffer), fd)) != NULL) {
-    int len = strlen(line);
+    dec_ip_str_t ip_str = {'\0'};
+    uint8_t bitlen;
+    in_addr_t net;
+    uint32_t mask;
+    FILE *fd = fopen(sss->community_file, "r");
+    struct sn_community *comm, *tmp_comm, *last_added_comm = NULL;
+    uint32_t num_communities = 0;
+    struct sn_community_regular_expression *re, *tmp_re;
+    uint32_t num_regex = 0;
+    int has_net;
 
-    if((len < 2) || line[0] == '#')
-      continue;
-
-    len--;
-    while(len > 0) {
-      if((line[len] == '\n') || (line[len] == '\r')) {
-	line[len] = '\0';
-	len--;
-      } else
-	break;
-    }
-
-    s = (struct sn_community*)calloc(1,sizeof(struct sn_community));
-
-    if(s != NULL) {
-      strncpy((char*)s->community, line, N2N_COMMUNITY_SIZE-1);
-      s->community[N2N_COMMUNITY_SIZE-1] = '\0';
-      /* we do not know if header encryption is used in this community,
-       * first packet will show. just in case, setup the key.           */
-      s->header_encryption = HEADER_ENCRYPTION_UNKNOWN;
-      packet_header_setup_key (s->community, &(s->header_encryption_ctx));
-      HASH_ADD_STR(sss->communities, community, s);
-
-      num_communities++;
-      traceEvent(TRACE_INFO, "Added allowed community '%s' [total: %u]",
-		 (char*)s->community, num_communities);
-    }
-  }
-
-  fclose(fd);
-
-  traceEvent(TRACE_NORMAL, "Loaded %u communities from %s",
-	     num_communities, path);
-
-  /* No new communities will be allowed */
-  sss->lock_communities = 1;
-
-  return(0);
-}
-
-/** Examine a datagram and determine what to do with it.
- *
- */
-static int process_udp(n2n_sn_t * sss,
-		       const struct sockaddr_in * sender_sock,
-		       uint8_t * udp_buf,
-		       size_t udp_size,
-		       time_t now)
-{
-  n2n_common_t        cmn; /* common fields in the packet header */
-  size_t              rem;
-  size_t              idx;
-  size_t              msg_type;
-  uint8_t             from_supernode;
-  macstr_t            mac_buf;
-  macstr_t            mac_buf2;
-  n2n_sock_str_t      sockbuf;
-  char                buf[32];
-  struct sn_community *comm, *tmp;
-
-  traceEvent(TRACE_DEBUG, "Processing incoming UDP packet [len: %lu][sender: %s:%u]",
-	     udp_size, intoa(ntohl(sender_sock->sin_addr.s_addr), buf, sizeof(buf)),
-	     ntohs(sender_sock->sin_port));
-
-  /* check if header is unenrypted. the following check is around 99.99962 percent reliable.
-   * it heavily relies on the structure of packet's common part
-   * changes to wire.c:encode/decode_common need to go together with this code */
-  if (udp_size < 20) {
-    traceEvent(TRACE_DEBUG, "process_udp dropped a packet too short to be valid.");
-    return -1;
-  }
-  if ( (udp_buf[19] == (uint8_t)0x00) // null terminated community name
-       && (udp_buf[00] == N2N_PKT_VERSION) // correct packet version
-       && ((be16toh (*(uint16_t*)&(udp_buf[02])) & N2N_FLAGS_TYPE_MASK ) <= MSG_TYPE_MAX_TYPE  ) // message type
-       && ( be16toh (*(uint16_t*)&(udp_buf[02])) < N2N_FLAGS_OPTIONS) // flags
-       ) {
-    /* most probably unencrypted */
-    /* make sure, no downgrading happens here and no unencrypted packets can be
-     * injected in a community which definitely deals with encrypted headers */
-    HASH_FIND_COMMUNITY(sss->communities, (char *)&udp_buf[04], comm);
-    if (comm) {
-      if (comm->header_encryption == HEADER_ENCRYPTION_ENABLED) {
-        traceEvent(TRACE_DEBUG, "process_udp dropped a packet with unencrypted header "
-                                "addressed to community '%s' which uses encrypted headers.",
-                                 comm->community);
+    if(fd == NULL) {
+        traceEvent(TRACE_WARNING, "File %s not found", sss->community_file);
         return -1;
-      }
-      if (comm->header_encryption == HEADER_ENCRYPTION_UNKNOWN) {
-	traceEvent (TRACE_INFO, "process_udp locked community '%s' to using "
-                                "unencrypted headers.", comm->community);
-        /* set 'no encryption' in case it is not set yet */
-        comm->header_encryption = HEADER_ENCRYPTION_NONE;
-        comm->header_encryption_ctx = NULL;
-      }
     }
-  } else {
-    /* most probably encrypted */
-    /* cycle through the known communities (as keys) to eventually decrypt */
-    uint32_t ret = 0;
-    HASH_ITER (hh, sss->communities, comm, tmp) {
-      /* skip the definitely unencrypted communities */
-      if (comm->header_encryption == HEADER_ENCRYPTION_NONE)
-        continue;
-      if ( (ret = packet_header_decrypt (udp_buf, udp_size, comm->community, comm->header_encryption_ctx)) ) {
-        if (comm->header_encryption == HEADER_ENCRYPTION_UNKNOWN) {
-	  traceEvent (TRACE_INFO, "process_udp locked community '%s' to using "
-                                  "encrypted headers.", comm->community);
-          /* set 'encrypted' in case it is not set yet */
-          comm->header_encryption = HEADER_ENCRYPTION_ENABLED;
+
+    // remove communities (not: federation)
+    HASH_ITER(hh, sss->communities, comm, tmp_comm) {
+        if(comm->is_federation) {
+            continue;
         }
-	// no need to test further communities
-        break;
-      }
-    }
-    if (!ret) {
-      // no matching key/community
-      traceEvent(TRACE_DEBUG, "process_udp dropped a packet with seemingly encrypted header "
-			      "for which no matching community which uses encrypted headers was found.");
-      return -1;
-    }
-  }
 
-  /* Use decode_common() to determine the kind of packet then process it:
-   *
-   * REGISTER_SUPER adds an edge and generate a return REGISTER_SUPER_ACK
-   *
-   * REGISTER, REGISTER_ACK and PACKET messages are forwarded to their
-   * destination edge. If the destination is not known then PACKETs are
-   * broadcast.
-   */
+        // remove allowed users from community
+        HASH_ITER(hh, comm->allowed_users, user, tmp_user) {
+            free(user->shared_secret_ctx);
+            HASH_DEL(comm->allowed_users, user);
+            free(user);
+        }
 
-  rem = udp_size; /* Counts down bytes of packet to protect against buffer overruns. */
-  idx = 0; /* marches through packet header as parts are decoded. */
-  if(decode_common(&cmn, udp_buf, &rem, &idx) < 0) {
-    traceEvent(TRACE_ERROR, "Failed to decode common section");
-    return -1; /* failed to decode packet */
-  }
-
-  msg_type = cmn.pc; /* packet code */
-  from_supernode= cmn.flags & N2N_FLAGS_FROM_SUPERNODE;
-
-  if(cmn.ttl < 1) {
-    traceEvent(TRACE_WARNING, "Expired TTL");
-    return 0; /* Don't process further */
-  }
-
-  --(cmn.ttl); /* The value copied into all forwarded packets. */
-
-  switch(msg_type) {
-  case MSG_TYPE_PACKET:
-  {
-    /* PACKET from one edge to another edge via supernode. */
-
-    /* pkt will be modified in place and recoded to an output of potentially
-     * different size due to addition of the socket.*/
-    n2n_PACKET_t                    pkt;
-    n2n_common_t                    cmn2;
-    uint8_t                         encbuf[N2N_SN_PKTBUF_SIZE];
-    size_t                          encx=0;
-    int                             unicast; /* non-zero if unicast */
-    uint8_t *                       rec_buf; /* either udp_buf or encbuf */
-
-    if(!comm) {
-      traceEvent(TRACE_DEBUG, "process_udp PACKET with unknown community %s", cmn.community);
-      return -1;
+        // remove community
+        HASH_DEL(sss->communities, comm);
+        if(NULL != comm->header_encryption_ctx_static) {
+            // remove header encryption keys
+            free(comm->header_encryption_ctx_static);
+            free(comm->header_encryption_ctx_dynamic);
+        }
+        free(comm);
     }
 
-    sss->stats.last_fwd=now;
-    decode_PACKET(&pkt, &cmn, udp_buf, &rem, &idx);
-
-    unicast = (0 == is_multi_broadcast(pkt.dstMac));
-
-    traceEvent(TRACE_DEBUG, "RX PACKET (%s) %s -> %s %s",
-	       (unicast?"unicast":"multicast"),
-	       macaddr_str(mac_buf, pkt.srcMac),
-	       macaddr_str(mac_buf2, pkt.dstMac),
-	       (from_supernode?"from sn":"local"));
-
-    if(!from_supernode) {
-      memcpy(&cmn2, &cmn, sizeof(n2n_common_t));
-
-      /* We are going to add socket even if it was not there before */
-      cmn2.flags |= N2N_FLAGS_SOCKET | N2N_FLAGS_FROM_SUPERNODE;
-
-      pkt.sock.family = AF_INET;
-      pkt.sock.port = ntohs(sender_sock->sin_port);
-      memcpy(pkt.sock.addr.v4, &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
-
-      rec_buf = encbuf;
-
-      /* Re-encode the header. */
-      encode_PACKET(encbuf, &encx, &cmn2, &pkt);
-
-      if (comm->header_encryption == HEADER_ENCRYPTION_ENABLED)
-        packet_header_encrypt (rec_buf, encx, comm->header_encryption_ctx);
-
-      /* Copy the original payload unchanged */
-      encode_buf(encbuf, &encx, (udp_buf + idx), (udp_size - idx));
-    } else {
-      /* Already from a supernode. Nothing to modify, just pass to
-       * destination. */
-
-      traceEvent(TRACE_DEBUG, "Rx PACKET fwd unmodified");
-
-      rec_buf = udp_buf;
-      encx = udp_size;
-
-      if (comm->header_encryption == HEADER_ENCRYPTION_ENABLED)
-        packet_header_encrypt (rec_buf, idx, comm->header_encryption_ctx);
+    // remove all regular expressions for allowed communities
+    HASH_ITER(hh, sss->rules, re, tmp_re) {
+        HASH_DEL(sss->rules, re);
+        free(re);
     }
 
-    /* Common section to forward the final product. */
-    if(unicast)
-      try_forward(sss, comm, &cmn, pkt.dstMac, rec_buf, encx);
-    else
-      try_broadcast(sss, comm, &cmn, pkt.srcMac, rec_buf, encx);
-    break;
-  }
-  case MSG_TYPE_REGISTER:
-  {
-    /* Forwarding a REGISTER from one edge to the next */
+    // format definition for possible user-key entries
+    sprintf(format, "%c %%%ds %%%ds", N2N_USER_KEY_LINE_STARTER, N2N_DESC_SIZE - 1, sizeof(ascii_public_key)-1);
 
-    n2n_REGISTER_t                  reg;
-    n2n_common_t                    cmn2;
-    uint8_t                         encbuf[N2N_SN_PKTBUF_SIZE];
-    size_t                          encx=0;
-    int                             unicast; /* non-zero if unicast */
-    uint8_t *                       rec_buf; /* either udp_buf or encbuf */
+    while((line = fgets(buffer, sizeof(buffer), fd)) != NULL) {
+        int len = strlen(line);
 
-    if(!comm) {
-      traceEvent(TRACE_DEBUG, "process_udp REGISTER from unknown community %s", cmn.community);
-      return -1;
+        if((len < 2) || line[0] == '#') {
+            continue;
+        }
+
+        len--;
+        while(len > 0) {
+            if((line[len] == '\n') || (line[len] == '\r')) {
+	        line[len] = '\0';
+	        len--;
+            } else {
+	        break;
+            }
+        }
+        // the loop above does not always determine correct 'len'
+        len = strlen(line);
+
+        // user-key line for edge authentication?
+        if(line[0] == N2N_USER_KEY_LINE_STARTER) { /* special first character */
+            if(sscanf(line, format, username, ascii_public_key) == 2) { /* correct format */
+                if(last_added_comm) { /* is there a valid community to add users to */
+                    user = (sn_user_t*)calloc(1, sizeof(sn_user_t));
+                    if(user) {
+                        // username
+                        memcpy(user->name, username, sizeof(username));
+                        // public key
+                        ascii_to_bin(public_key, ascii_public_key);
+                        memcpy(user->public_key, public_key, sizeof(public_key));
+                        // common shared secret will be calculated later
+                        // add to list
+                        HASH_ADD(hh, last_added_comm->allowed_users, public_key, sizeof(n2n_private_public_key_t), user);
+                        traceEvent(TRACE_INFO, "Added user '%s' with public key '%s' to community '%s'",
+                                               user->name, ascii_public_key, last_added_comm->community);
+                        // enable header encryption
+                        last_added_comm->header_encryption = HEADER_ENCRYPTION_ENABLED;
+                        packet_header_setup_key(last_added_comm->community,
+                                                &(last_added_comm->header_encryption_ctx_static),
+                                                &(last_added_comm->header_encryption_ctx_dynamic),
+                                                &(last_added_comm->header_iv_ctx_static),
+                                                &(last_added_comm->header_iv_ctx_dynamic));
+                        // dynamic key setup
+                        last_added_comm->last_dynamic_key_time = time(NULL);
+                        calculate_dynamic_key(last_added_comm->dynamic_key,           /* destination */
+                                              last_added_comm->last_dynamic_key_time, /* time */
+                                              last_added_comm->community,             /* community name */
+                                              sss->federation->community);            /* federation name */
+                        packet_header_change_dynamic_key(last_added_comm->dynamic_key,
+                                             &(last_added_comm->header_encryption_ctx_dynamic),
+                                             &(last_added_comm->header_iv_ctx_dynamic));
+
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // --- community name or regular expression
+
+        // cut off any IP sub-network upfront
+        cmn_str = (char*)calloc(len + 1, sizeof(char));
+        has_net = (sscanf(line, "%s %s", cmn_str, net_str) == 2);
+
+        // if it contains typical characters...
+        if(NULL != strpbrk(cmn_str, ".*+?[]\\")) {
+            // ...it is treated as regular expression
+            re = (struct sn_community_regular_expression*)calloc(1, sizeof(struct sn_community_regular_expression));
+            if(re) {
+                re->rule = re_compile(cmn_str);
+                HASH_ADD_PTR(sss->rules, rule, re);
+	        num_regex++;
+                traceEvent(TRACE_INFO, "Added regular expression for allowed communities '%s'", cmn_str);
+                free(cmn_str);
+                last_added_comm = NULL;
+                continue;
+            }
+        }
+
+        comm = (struct sn_community*)calloc(1,sizeof(struct sn_community));
+
+        if(comm != NULL) {
+            comm_init(comm, cmn_str);
+            /* loaded from file, this community is unpurgeable */
+            comm->purgeable = COMMUNITY_UNPURGEABLE;
+            /* we do not know if header encryption is used in this community,
+             * first packet will show. just in case, setup the key. */
+            comm->header_encryption = HEADER_ENCRYPTION_UNKNOWN;
+            packet_header_setup_key(comm->community,
+                                    &(comm->header_encryption_ctx_static),
+                                    &(comm->header_encryption_ctx_dynamic),
+                                    &(comm->header_iv_ctx_static),
+                                    &(comm->header_iv_ctx_dynamic));
+            HASH_ADD_STR(sss->communities, community, comm);
+            last_added_comm = comm;
+
+            num_communities++;
+            traceEvent(TRACE_INFO, "Added allowed community '%s' [total: %u]",
+		       (char*)comm->community, num_communities);
+
+            // check for sub-network address
+            if(has_net) {
+                if(sscanf(net_str, "%15[^/]/%hhu", ip_str, &bitlen) != 2) {
+                    traceEvent(TRACE_WARNING, "Bad net/bit format '%s' for community '%c', ignoring. See comments inside community.list file.",
+		                           net_str, cmn_str);
+                    has_net = 0;
+                }
+                net = inet_addr(ip_str);
+                mask = bitlen2mask(bitlen);
+                if((net == (in_addr_t)(-1)) || (net == INADDR_NONE) || (net == INADDR_ANY)
+	                 || ((ntohl(net) & ~mask) != 0)) {
+                    traceEvent(TRACE_WARNING, "Bad network '%s/%u' in '%s' for community '%s', ignoring.",
+		                           ip_str, bitlen, net_str, cmn_str);
+                    has_net = 0;
+                }
+                if((bitlen > 30) || (bitlen == 0)) {
+                    traceEvent(TRACE_WARNING, "Bad prefix '%hhu' in '%s' for community '%s', ignoring.",
+		                           bitlen, net_str, cmn_str);
+                    has_net = 0;
+                }
+            }
+            if(has_net) {
+                comm->auto_ip_net.net_addr = ntohl(net);
+                comm->auto_ip_net.net_bitlen = bitlen;
+                traceEvent(TRACE_INFO, "Assigned sub-network %s/%u to community '%s'.",
+		                       inet_ntoa(*(struct in_addr *) &net),
+		           comm->auto_ip_net.net_bitlen,
+		           comm->community);
+            } else {
+                assign_one_ip_subnet(sss, comm);
+            }
+        }
+
+        free(cmn_str);
+
     }
 
-    sss->stats.last_fwd=now;
-    decode_REGISTER(&reg, &cmn, udp_buf, &rem, &idx);
+    fclose(fd);
 
-    unicast = (0 == is_multi_broadcast(reg.dstMac));
-
-    if(unicast) {
-      traceEvent(TRACE_DEBUG, "Rx REGISTER %s -> %s %s",
-		 macaddr_str(mac_buf, reg.srcMac),
-		 macaddr_str(mac_buf2, reg.dstMac),
-		 ((cmn.flags & N2N_FLAGS_FROM_SUPERNODE)?"from sn":"local"));
-
-      if(0 == (cmn.flags & N2N_FLAGS_FROM_SUPERNODE)) {
-	memcpy(&cmn2, &cmn, sizeof(n2n_common_t));
-
-	/* We are going to add socket even if it was not there before */
-	cmn2.flags |= N2N_FLAGS_SOCKET | N2N_FLAGS_FROM_SUPERNODE;
-
-	reg.sock.family = AF_INET;
-	reg.sock.port = ntohs(sender_sock->sin_port);
-	memcpy(reg.sock.addr.v4, &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
-
-	rec_buf = encbuf;
-
-	/* Re-encode the header. */
-	encode_REGISTER(encbuf, &encx, &cmn2, &reg);
-
-	/* Copy the original payload unchanged */
-	encode_buf(encbuf, &encx, (udp_buf + idx), (udp_size - idx));
-      } else {
-	/* Already from a supernode. Nothing to modify, just pass to
-	 * destination. */
-
-	rec_buf = udp_buf;
-	encx = udp_size;
-      }
-
-      if (comm->header_encryption == HEADER_ENCRYPTION_ENABLED)
-        packet_header_encrypt (rec_buf, idx, comm->header_encryption_ctx);
-
-      try_forward(sss, comm, &cmn, reg.dstMac, rec_buf, encx); /* unicast only */
-    } else
-      traceEvent(TRACE_ERROR, "Rx REGISTER with multicast destination");
-    break;
-  }
-  case MSG_TYPE_REGISTER_ACK:
-    traceEvent(TRACE_DEBUG, "Rx REGISTER_ACK (NOT IMPLEMENTED) SHould not be via supernode");
-    break;
-  case MSG_TYPE_REGISTER_SUPER:
-  {
-    n2n_REGISTER_SUPER_t            reg;
-    n2n_REGISTER_SUPER_ACK_t        ack;
-    n2n_common_t                    cmn2;
-    uint8_t                         ackbuf[N2N_SN_PKTBUF_SIZE];
-    size_t                          encx=0;
-
-    /* Edge requesting registration with us.  */
-    sss->stats.last_reg_super=now;
-    ++(sss->stats.reg_super);
-    decode_REGISTER_SUPER(&reg, &cmn, udp_buf, &rem, &idx);
-
-    /*
-      Before we move any further, we need to check if the requested
-      community is allowed by the supernode. In case it is not we do
-      not report any message back to the edge to hide the supernode
-      existance (better from the security standpoint)
-    */
-    if(!comm && !sss->lock_communities) {
-      comm = calloc(1, sizeof(struct sn_community));
-
-      if(comm) {
-	strncpy(comm->community, (char*)cmn.community, N2N_COMMUNITY_SIZE-1);
-	comm->community[N2N_COMMUNITY_SIZE-1] = '\0';
-        /* new communities introduced by REGISTERs could not have had encrypted header */
-        comm->header_encryption = HEADER_ENCRYPTION_NONE;
-	comm->header_encryption_ctx = NULL;
-
-	HASH_ADD_STR(sss->communities, community, comm);
-
-	traceEvent(TRACE_INFO, "New community: %s", comm->community);
-      }
+    if((num_regex + num_communities) == 0) {
+        traceEvent(TRACE_WARNING, "File %s does not contain any valid community names or regular expressions", sss->community_file);
+        return -1;
     }
 
-    if(comm) {
-      cmn2.ttl = N2N_DEFAULT_TTL;
-      cmn2.pc = n2n_register_super_ack;
-      cmn2.flags = N2N_FLAGS_SOCKET | N2N_FLAGS_FROM_SUPERNODE;
-      memcpy(cmn2.community, cmn.community, sizeof(n2n_community_t));
+    traceEvent(TRACE_NORMAL, "Loaded %u fixed-name communities from %s",
+	             num_communities, sss->community_file);
 
-      memcpy(&(ack.cookie), &(reg.cookie), sizeof(n2n_cookie_t));
-      memcpy(ack.edgeMac, reg.edgeMac, sizeof(n2n_mac_t));
-      ack.lifetime = reg_lifetime(sss);
+    traceEvent(TRACE_NORMAL, "Loaded %u regular expressions for community name matching from %s",
+	             num_regex, sss->community_file);
 
-      ack.sock.family = AF_INET;
-      ack.sock.port = ntohs(sender_sock->sin_port);
-      memcpy(ack.sock.addr.v4, &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
+    /* No new communities will be allowed */
+    sss->lock_communities = 1;
 
-      ack.num_sn=0; /* No backup */
-      memset(&(ack.sn_bak), 0, sizeof(n2n_sock_t));
-
-      traceEvent(TRACE_DEBUG, "Rx REGISTER_SUPER for %s [%s]",
-		 macaddr_str(mac_buf, reg.edgeMac),
-		 sock_to_cstr(sockbuf, &(ack.sock)));
-
-      update_edge(sss, reg.edgeMac, comm, &(ack.sock), now);
-
-      encode_REGISTER_SUPER_ACK(ackbuf, &encx, &cmn2, &ack);
-
-      if (comm->header_encryption == HEADER_ENCRYPTION_ENABLED)
-        packet_header_encrypt (ackbuf, encx, comm->header_encryption_ctx);
-
-      sendto(sss->sock, ackbuf, encx, 0,
-	     (struct sockaddr *)sender_sock, sizeof(struct sockaddr_in));
-
-      traceEvent(TRACE_DEBUG, "Tx REGISTER_SUPER_ACK for %s [%s]",
-		 macaddr_str(mac_buf, reg.edgeMac),
-		 sock_to_cstr(sockbuf, &(ack.sock)));
-    } else
-      traceEvent(TRACE_INFO, "Discarded registration: unallowed community '%s'",
-		 (char*)cmn.community);
-    break;
-  }
-  case MSG_TYPE_QUERY_PEER: {
-    n2n_QUERY_PEER_t query;
-    uint8_t encbuf[N2N_SN_PKTBUF_SIZE];
-    size_t encx=0;
-    n2n_common_t cmn2;
-    n2n_PEER_INFO_t pi;
-
-    if(!comm) {
-      traceEvent(TRACE_DEBUG, "process_udp QUERY_PEER from unknown community %s", cmn.community);
-      return -1;
-    }
-
-    decode_QUERY_PEER( &query, &cmn, udp_buf, &rem, &idx );
-
-    traceEvent( TRACE_DEBUG, "Rx QUERY_PEER from %s for %s",
-                macaddr_str( mac_buf,  query.srcMac ),
-                macaddr_str( mac_buf2, query.targetMac ) );
-
-    struct peer_info *scan;
-    HASH_FIND_PEER(comm->edges, query.targetMac, scan);
-
-    if (scan) {
-      cmn2.ttl = N2N_DEFAULT_TTL;
-      cmn2.pc = n2n_peer_info;
-      cmn2.flags = N2N_FLAGS_FROM_SUPERNODE;
-      memcpy( cmn2.community, cmn.community, sizeof(n2n_community_t) );
-
-      pi.aflags = 0;
-      memcpy( pi.mac, query.targetMac, sizeof(n2n_mac_t) );
-      pi.sock = scan->sock;
-
-      encode_PEER_INFO( encbuf, &encx, &cmn2, &pi );
-
-      if (comm->header_encryption == HEADER_ENCRYPTION_ENABLED)
-        packet_header_encrypt (encbuf, encx, comm->header_encryption_ctx);
-
-      sendto( sss->sock, encbuf, encx, 0,
-	      (struct sockaddr *)sender_sock, sizeof(struct sockaddr_in) );
-
-      traceEvent( TRACE_DEBUG, "Tx PEER_INFO to %s",
-		                macaddr_str( mac_buf, query.srcMac ) );
-    } else {
-      traceEvent( TRACE_DEBUG, "Ignoring QUERY_PEER for unknown edge %s",
-	                        macaddr_str( mac_buf, query.targetMac ) );
-    }
-
-  break;
-  }
-  default:
-    /* Not a known message type */
-    traceEvent(TRACE_WARNING, "Unable to handle packet type %d: ignored", (signed int)msg_type);
-  } /* switch(msg_type) */
-
-  return 0;
+    return 0;
 }
+
 
 /* *************************************************** */
 
 /** Help message to print if the command line arguments are not valid. */
-static void help() {
-  print_n2n_version();
+static void help (int level) {
 
-  printf("supernode <config file> (see supernode.conf)\n"
-	 "or\n"
-	 );
-  printf("supernode ");
-  printf("-l <lport> ");
-  printf("-c <path> ");
-#if defined(N2N_HAVE_DAEMON)
-  printf("[-f] ");
+    if(level == 0) /* no help required */
+        return;
+
+    printf("\n");
+    print_n2n_version();
+
+    if(level == 1) /* short help */ {
+
+        printf("   basic usage:  supernode <config file> (see supernode.conf)\n"
+               "\n"
+               "            or   supernode "
+               "[optional parameters, at least one] "
+               "\n                      "
+               "\n technically, all parameters are optional, but the supernode executable"
+               "\n requires at least one parameter to run, .e.g. -v or -f, as otherwise this"
+               "\n short help text is displayed"
+             "\n\n  -h    shows a quick reference including all available options"
+               "\n --help gives a detailed parameter description"
+               "\n   man  files for n2n, edge, and superndode contain in-depth information"
+               "\n\n");
+
+    } else if(level == 2) /* quick reference */ {
+
+        printf(" general usage:  supernode <config file> (see supernode.conf)\n"
+           "\n"
+               "            or   supernode "
+               "[-p <local port>] "
+            "\n                           "
+               "[-F <federation name>] "
+            "\n options for under-        "
+               "[-l <supernode host:port>] "
+            "\n lying connection          "
+#ifdef SN_MANUAL_MAC
+               "[-m <mac address>] "
 #endif
-  printf("[-v] ");
-  printf("\n\n");
-
-  printf("-l <lport>\tSet UDP main listen port to <lport>\n");
-  printf("-c <path>\tFile containing the allowed communities.\n");
+          "\n\n overlay network           "
+               "[-c <community list file>] "
+            "\n configuration             "
+               "[-a <net ip>-<net ip>/<cidr suffix>] "
+          "\n\n local options             "
 #if defined(N2N_HAVE_DAEMON)
-  printf("-f        \tRun in foreground.\n");
-#endif /* #if defined(N2N_HAVE_DAEMON) */
-  printf("-v        \tIncrease verbosity. Can be used multiple times.\n");
-  printf("-h        \tThis help message.\n");
-  printf("\n");
+               "[-f] "
+#endif
+               "[-t <management port>] "
+               "[-v] "
+#ifndef WIN32
+            "\n                           "
+               "[-u <numerical user id>]"
+               "[-g <numerical group id>]"
+#endif
+          "\n\n meaning of the            "
+#if defined(N2N_HAVE_DAEMON)
+                "[-f]  do not fork but run in foreground"
+#endif
+            "\n flag options              "
+                "[-v]  make more verbose, repeat as required"
+            "\n                           "
+          "\n technically, all parameters are optional, but the supernode executable"
+          "\n requires at least one parameter to run, .e.g. -v or -f, as otherwise a"
+          "\n short help text is displayed"
+        "\n\n  -h    shows this quick reference including all available options"
+          "\n --help gives a detailed parameter description"
+          "\n   man  files for n2n, edge, and superndode contain in-depth information"
+          "\n\n");
 
-  exit(1);
+    } else /* long help */ {
+
+        printf(" general usage:  supernode <config file> (see supernode.conf)\n"
+               "\n"
+               "            or   supernode [optional parameters, at least one]\n\n"
+        );
+        printf (" OPTIONS FOR THE UNDERLYING NETWORK CONNECTION\n");
+        printf (" ---------------------------------------------\n\n");
+        printf(" -p <local port>   | fixed local UDP port, defaults to %u\n", N2N_SN_LPORT_DEFAULT);
+        printf(" -F <fed name>     | name of the supernode's federation, defaults to\n"
+               "                   | '%s'\n", (char *)FEDERATION_NAME);
+        printf(" -l <host:port>    | ip address or name, and port of known supernode\n");
+#ifdef SN_MANUAL_MAC
+        printf(" -m <mac>          | fixed MAC address for the supernode, e.g.\n"
+               "                   | '-m 10:20:30:40:50:60', random otherwise\n");
+#endif
+        printf ("\n");
+        printf (" TAP DEVICE AND OVERLAY NETWORK CONFIGURATION\n");
+        printf (" --------------------------------------------\n\n");
+        printf(" -c <path>         | file containing the allowed communities\n");
+        printf(" -a <net-net/n>    | subnet range for auto ip address service, e.g.\n"
+               "                   | '-a 192.168.0.0-192.168.255.0/24', defaults\n"
+               "                   | to '10.128.255.0-10.255.255.0/24'\n");
+        printf ("\n");
+        printf (" LOCAL OPTIONS\n");
+        printf (" -------------\n\n");
+#if defined(N2N_HAVE_DAEMON)
+        printf(" -f                | do not fork and run as a daemon, rather run in foreground\n");
+#endif
+        printf(" -t <port>         | management UDP port, for multiple supernodes on a machine,\n"
+               "                   | defaults to %u\n", N2N_SN_MGMT_PORT);
+        printf(" -v                | make more verbose, repeat as required\n");
+#ifndef WIN32
+        printf(" -u <UID>          | numeric user ID to use when privileges are dropped\n");
+        printf(" -g <GID>          | numeric group ID to use when privileges are dropped\n");
+#endif
+        printf("\n technically, all parameters are optional, but the supernode executable"
+               "\n requires at least one parameter to run, .e.g. -v or -f, as otherwise a"
+               "\n short help text is displayed"
+             "\n\n  -h    shows a quick reference including all available options"
+               "\n --help gives this detailed parameter description"
+               "\n   man  files for n2n, edge, and superndode contain in-depth information"
+               "\n\n");
+    }
+
+    exit(0);
 }
+
 
 /* *************************************************** */
 
-static int run_loop(n2n_sn_t * sss);
+static int setOption (int optkey, char *_optarg, n2n_sn_t *sss) {
 
-/* *************************************************** */
+    //traceEvent(TRACE_NORMAL, "Option %c = %s", optkey, _optarg ? _optarg : "");
 
-static int setOption(int optkey, char *_optarg, n2n_sn_t *sss) {
-  //traceEvent(TRACE_NORMAL, "Option %c = %s", optkey, _optarg ? _optarg : "");
+    switch(optkey) {
+        case 'p': /* local-port */
+            sss->lport = atoi(_optarg);
 
-  switch(optkey) {
-  case 'l': /* local-port */
-    sss->lport = atoi(_optarg);
-    break;
+            if(sss->lport == 0)
+                traceEvent(TRACE_WARNING, "Bad local port format, defaulting to %u", N2N_SN_LPORT_DEFAULT);
+                // default is made sure in sn_init()
 
-  case 'c': /* community file */
-    load_allowed_sn_community(sss, _optarg);
-    break;
+            break;
 
-  case 'f': /* foreground */
-    sss->daemon = 0;
-    break;
+        case 't': /* mgmt-port */
+            sss->mport = atoi(_optarg);
 
-  case 'h': /* help */
-    help();
-    break;
+            if(sss->mport == 0)
+                traceEvent(TRACE_WARNING, "Bad management port format, defaulting to %u", N2N_SN_MGMT_PORT);
+                // default is made sure in sn_init()
 
-  case 'v': /* verbose */
-    setTraceLevel(getTraceLevel() + 1);
-    break;
+            break;
 
-  default:
-    traceEvent(TRACE_WARNING, "Unknown option -%c: Ignored.", (char)optkey);
-    return(-1);
-  }
+        case 'l': { /* supernode:port */
+            n2n_sock_t *socket;
+            struct peer_info *anchor_sn;
+            size_t length;
+            int rv = -1;
+            int skip_add;
+            char *double_column = strchr(_optarg, ':');
 
-  return(0);
+            length = strlen(_optarg);
+            if(length >= N2N_EDGE_SN_HOST_SIZE) {
+                traceEvent(TRACE_WARNING, "Size of -l argument too long: %zu. Maximum size is %d", length, N2N_EDGE_SN_HOST_SIZE);
+                return 1;
+            }
+
+            if(!double_column) {
+                traceEvent(TRACE_WARNING, "Invalid -l format: missing port");
+                return 1;
+            }
+
+            socket = (n2n_sock_t *)calloc(1, sizeof(n2n_sock_t));
+            rv = supernode2sock(socket, _optarg);
+
+            if(rv < -2) { /* we accept resolver failure as it might resolve later */
+                traceEvent(TRACE_WARNING, "Invalid supernode parameter.");
+                free(socket);
+                return 1;
+            }
+
+            if(sss->federation != NULL) {
+                skip_add = SN_ADD;
+                anchor_sn = add_sn_to_list_by_mac_or_sock(&(sss->federation->edges), socket, null_mac, &skip_add);
+
+                if(anchor_sn != NULL) {
+                    anchor_sn->ip_addr = calloc(1, N2N_EDGE_SN_HOST_SIZE);
+                    if(anchor_sn->ip_addr) {
+                        strncpy(anchor_sn->ip_addr, _optarg, N2N_EDGE_SN_HOST_SIZE - 1);
+	                      memcpy(&(anchor_sn->sock), socket, sizeof(n2n_sock_t));
+                        memcpy(anchor_sn->mac_addr, null_mac, sizeof(n2n_mac_t));
+                        anchor_sn->purgeable = SN_UNPURGEABLE;
+                        anchor_sn->last_valid_time_stamp = initial_time_stamp();
+                    }
+                }
+            }
+
+            free(socket);
+            break;
+        }
+
+        case 'a': {
+            dec_ip_str_t ip_min_str = {'\0'};
+            dec_ip_str_t ip_max_str = {'\0'};
+            in_addr_t net_min, net_max;
+            uint8_t bitlen;
+            uint32_t mask;
+
+            if(sscanf(_optarg, "%15[^\\-]-%15[^/]/%hhu", ip_min_str, ip_max_str, &bitlen) != 3) {
+                traceEvent(TRACE_WARNING, "Bad net-net/bit format '%s'.", _optarg);
+                return 2;
+            }
+
+            net_min = inet_addr(ip_min_str);
+            net_max = inet_addr(ip_max_str);
+            mask = bitlen2mask(bitlen);
+            if((net_min == (in_addr_t)(-1)) || (net_min == INADDR_NONE) || (net_min == INADDR_ANY)
+	             || (net_max == (in_addr_t)(-1)) || (net_max == INADDR_NONE) || (net_max == INADDR_ANY)
+	             || (ntohl(net_min) >  ntohl(net_max))
+	             || ((ntohl(net_min) & ~mask) != 0) || ((ntohl(net_max) & ~mask) != 0)) {
+                traceEvent(TRACE_WARNING, "Bad network range '%s...%s/%u' in '%s', defaulting to '%s...%s/%d'",
+		                       ip_min_str, ip_max_str, bitlen, _optarg,
+		                       N2N_SN_MIN_AUTO_IP_NET_DEFAULT, N2N_SN_MAX_AUTO_IP_NET_DEFAULT, N2N_SN_AUTO_IP_NET_BIT_DEFAULT);
+                return 2;
+            }
+
+            if((bitlen > 30) || (bitlen == 0)) {
+                traceEvent(TRACE_WARNING, "Bad prefix '%hhu' in '%s', defaulting to '%s...%s/%d'",
+		                       bitlen, _optarg,
+		                       N2N_SN_MIN_AUTO_IP_NET_DEFAULT, N2N_SN_MAX_AUTO_IP_NET_DEFAULT, N2N_SN_AUTO_IP_NET_BIT_DEFAULT);
+                return 2;
+            }
+
+            traceEvent(TRACE_NORMAL, "The network range for community ip address service is '%s...%s/%hhu'.", ip_min_str, ip_max_str, bitlen);
+
+            sss->min_auto_ip_net.net_addr = ntohl(net_min);
+            sss->min_auto_ip_net.net_bitlen = bitlen;
+            sss->max_auto_ip_net.net_addr = ntohl(net_max);
+            sss->max_auto_ip_net.net_bitlen = bitlen;
+
+            break;
+        }
+#ifndef WIN32
+        case 'u': /* unprivileged uid */
+            sss->userid = atoi(_optarg);
+            break;
+
+        case 'g': /* unprivileged uid */
+            sss->groupid = atoi(_optarg);
+            break;
+#endif
+        case 'F': { /* federation name */
+            snprintf(sss->federation->community, N2N_COMMUNITY_SIZE - 1 ,"*%s", _optarg);
+            sss->federation->community[N2N_COMMUNITY_SIZE - 1] = '\0';
+            break;
+        }
+#ifdef SN_MANUAL_MAC
+        case 'm': {/* MAC address */
+            str2mac(sss->mac_addr,_optarg);
+            break;
+        }
+#endif
+        case 'c': /* community file */
+            sss->community_file = calloc(1, strlen(_optarg) + 1);
+            if(sss->community_file)
+                strcpy(sss->community_file, _optarg);
+            break;
+#if defined(N2N_HAVE_DAEMON)
+        case 'f': /* foreground */
+            sss->daemon = 0;
+            break;
+#endif
+        case 'h': /* quick reference */
+            return 2;
+
+        case '@': /* long help */
+            return 3;
+
+        case 'v': /* verbose */
+            setTraceLevel(getTraceLevel() + 1);
+            break;
+
+        default:
+            traceEvent(TRACE_WARNING, "Unknown option -%c:", (char) optkey);
+            return 2;
+    }
+
+    return 0;
 }
+
 
 /* *********************************************** */
 
 static const struct option long_options[] = {
-  { "communities",     required_argument, NULL, 'c' },
-  { "foreground",      no_argument,       NULL, 'f' },
-  { "local-port",      required_argument, NULL, 'l' },
-  { "help"   ,         no_argument,       NULL, 'h' },
-  { "verbose",         no_argument,       NULL, 'v' },
-  { NULL,              0,                 NULL,  0  }
+    {"communities", required_argument, NULL, 'c'},
+#if defined(N2N_HAVE_DAEMON)
+    {"foreground",  no_argument,       NULL, 'f'},
+#endif
+    {"local-port",  required_argument, NULL, 'p'},
+    {"mgmt-port",   required_argument, NULL, 't'},
+    {"autoip",      required_argument, NULL, 'a'},
+    {"help",        no_argument,       NULL, '@'}, /* special character '@' to identify long help case */
+    {"verbose",     no_argument,       NULL, 'v'},
+    {NULL,          0,                 NULL, 0}
 };
 
 /* *************************************************** */
 
 /* read command line options */
-static int loadFromCLI(int argc, char * const argv[], n2n_sn_t *sss) {
-  u_char c;
+static int loadFromCLI (int argc, char * const argv[], n2n_sn_t *sss) {
 
-  while((c = getopt_long(argc, argv, "fl:c:vh",
-			 long_options, NULL)) != '?') {
-    if(c == 255) break;
-    setOption(c, optarg, sss);
-  }
+    u_char c;
 
-  return 0;
+    while((c = getopt_long(argc, argv,
+                           "p:l:t:a:c:F:vh"
+#ifdef SN_MANUAL_MAC
+                           "m:"
+#endif
+#if defined(N2N_HAVE_DAEMON)
+                           "f"
+#endif
+#ifndef WIN32
+                           "u:g:"
+#endif
+                            ,
+			    long_options, NULL)) != '?') {
+        if(c == 255) {
+            break;
+        }
+        help(setOption(c, optarg, sss));
+    }
+
+    return 0;
 }
 
 /* *************************************************** */
 
-static char *trim(char *s) {
-  char *end;
+static char *trim (char *s) {
 
-  while(isspace(s[0]) || (s[0] == '"') || (s[0] == '\''))
-    s++;
+    char *end;
 
-  if(s[0] == 0) return s;
+    while(isspace(s[0]) || (s[0] == '"') || (s[0] == '\'')) {
+        s++;
+    }
 
-  end = &s[strlen(s) - 1];
-  while(end > s
-	&& (isspace(end[0])|| (end[0] == '"') || (end[0] == '\'')))
-    end--;
-  end[1] = 0;
+    if(s[0] == 0) {
+        return s;
+    }
 
-  return s;
+    end = &s[strlen(s) - 1];
+    while(end > s && (isspace(end[0])|| (end[0] == '"') || (end[0] == '\''))) {
+        end--;
+    }
+    end[1] = 0;
+
+    return s;
 }
 
 /* *************************************************** */
 
 /* parse the configuration file */
-static int loadFromFile(const char *path, n2n_sn_t *sss) {
-  char buffer[4096], *line, *key, *value;
-  u_int line_len, opt_name_len;
-  FILE *fd;
-  const struct option *opt;
+static int loadFromFile (const char *path, n2n_sn_t *sss) {
 
-  fd = fopen(path, "r");
+    char buffer[4096], *line;
+    char *line_vec[3];
+    int tmp;
 
-  if(fd == NULL) {
-    traceEvent(TRACE_WARNING, "Config file %s not found", path);
-    return -1;
-  }
+    FILE *fd;
 
-  while((line = fgets(buffer, sizeof(buffer), fd)) != NULL) {
+    fd = fopen(path, "r");
 
-    line = trim(line);
-    value = NULL;
-
-    if((line_len = strlen(line)) < 2 || line[0] == '#')
-      continue;
-
-    if(!strncmp(line, "--", 2)) { /* long opt */
-      key = &line[2], line_len -= 2;
-
-      opt = long_options;
-      while(opt->name != NULL) {
-	opt_name_len = strlen(opt->name);
-
-	if(!strncmp(key, opt->name, opt_name_len)
-	   && (line_len <= opt_name_len
-	       || key[opt_name_len] == '\0'
-	       || key[opt_name_len] == ' '
-	       || key[opt_name_len] == '=')) {
-	  if(line_len > opt_name_len)	  key[opt_name_len] = '\0';
-	  if(line_len > opt_name_len + 1) value = trim(&key[opt_name_len + 1]);
-
-	  // traceEvent(TRACE_NORMAL, "long key: %s value: %s", key, value);
-	  setOption(opt->val, value, sss);
-	  break;
-	}
-
-	opt++;
-      }
-    } else if(line[0] == '-') { /* short opt */
-      key = &line[1], line_len--;
-      if(line_len > 1) key[1] = '\0';
-      if(line_len > 2) value = trim(&key[2]);
-
-      // traceEvent(TRACE_NORMAL, "key: %c value: %s", key[0], value);
-      setOption(key[0], value, sss);
-    } else {
-      traceEvent(TRACE_WARNING, "Skipping unrecognized line: %s", line);
-      continue;
+    if(fd == NULL) {
+        traceEvent(TRACE_WARNING, "Config file %s not found", path);
+        return -1;
     }
-  }
 
-  fclose(fd);
+    // we mess around with optind, better save it
+    tmp = optind;
 
-  return 0;
+    while((line = fgets(buffer, sizeof(buffer), fd)) != NULL) {
+        line = trim(line);
+
+        if(strlen(line) < 2 || line[0] == '#') {
+            continue;
+        }
+
+        // executable, cannot be omitted, content can be anything
+        line_vec[0] = line;
+        // first token, e.g. `-p`, eventually followed by a whitespace or '=' delimiter
+        line_vec[1] = strtok(line, "\t =");
+        // separate parameter option, if present
+        line_vec[2] = strtok(NULL, "\t ");
+
+        // not to duplicate the option parser code, call loadFromCLI and pretend we have no option read yet
+        optind = 0;
+        // if separate second token present (optional argument, not part of first), then announce 3 vector members
+        loadFromCLI(line_vec[2] ? 3 : 2, line_vec, sss);
+    }
+
+    fclose(fd);
+    optind = tmp;
+
+    return 0;
+}
+
+/* *************************************************** */
+
+/* Add the federation to the communities list of a supernode */
+static int add_federation_to_communities (n2n_sn_t *sss) {
+
+    uint32_t    num_communities = 0;
+
+    if(sss->federation != NULL) {
+        HASH_ADD_STR(sss->communities, community, sss->federation);
+
+        num_communities = HASH_COUNT(sss->communities);
+
+        traceEvent(TRACE_INFO, "Added federation '%s' to the list of communities [total: %u]",
+	                 (char*)sss->federation->community, num_communities);
+    }
+
+    return 0;
 }
 
 /* *************************************************** */
 
 #ifdef __linux__
-static void dump_registrations(int signo) {
-  struct sn_community *comm, *ctmp;
-  struct peer_info *list, *tmp;
-  char buf[32];
-  time_t now = time(NULL);
-  u_int num = 0;
+static void dump_registrations (int signo) {
 
-  traceEvent(TRACE_NORMAL, "====================================");
+    struct sn_community *comm, *ctmp;
+    struct peer_info *list, *tmp;
+    char buf[32];
+    time_t now = time(NULL);
+    u_int num = 0;
 
-  HASH_ITER(hh, sss_node.communities, comm, ctmp) {
-    traceEvent(TRACE_NORMAL, "Dumping community: %s", comm->community);
+    traceEvent(TRACE_NORMAL, "====================================");
 
-    HASH_ITER(hh, comm->edges, list, tmp) {
-      if(list->sock.family == AF_INET)
-	traceEvent(TRACE_NORMAL, "[id: %u][MAC: %s][edge: %u.%u.%u.%u:%u][last seen: %u sec ago]",
-		   ++num, macaddr_str(buf, list->mac_addr),
-		   list->sock.addr.v4[0], list->sock.addr.v4[1], list->sock.addr.v4[2], list->sock.addr.v4[3],
-		   list->sock.port,
-		   now-list->last_seen);
-      else
-	traceEvent(TRACE_NORMAL, "[id: %u][MAC: %s][edge: IPv6:%u][last seen: %u sec ago]",
-		   ++num, macaddr_str(buf, list->mac_addr), list->sock.port,
-		   now-list->last_seen);
+    HASH_ITER(hh, sss_node.communities, comm, ctmp) {
+        traceEvent(TRACE_NORMAL, "Dumping community: %s", comm->community);
+
+        HASH_ITER(hh, comm->edges, list, tmp) {
+            if(list->sock.family == AF_INET) {
+	              traceEvent(TRACE_NORMAL, "[id: %u][MAC: %s][edge: %u.%u.%u.%u:%u][last seen: %u sec ago]",
+		                       ++num, macaddr_str(buf, list->mac_addr),
+		                       list->sock.addr.v4[0], list->sock.addr.v4[1], list->sock.addr.v4[2], list->sock.addr.v4[3],
+		                       list->sock.port,
+		                       now - list->last_seen);
+            } else {
+	              traceEvent(TRACE_NORMAL, "[id: %u][MAC: %s][edge: IPv6:%u][last seen: %u sec ago]",
+		                       ++num, macaddr_str(buf, list->mac_addr), list->sock.port,
+		                       now - list->last_seen);
+            }
+        }
     }
-  }
 
-  traceEvent(TRACE_NORMAL, "====================================");
+    traceEvent(TRACE_NORMAL, "====================================");
 }
 #endif
 
@@ -1015,24 +700,24 @@ static int keep_running;
 
 #if defined(__linux__) || defined(WIN32)
 #ifdef WIN32
-BOOL WINAPI term_handler(DWORD sig)
+BOOL WINAPI term_handler (DWORD sig)
 #else
-static void term_handler(int sig)
+    static void term_handler(int sig)
 #endif
 {
-  static int called = 0;
+    static int called = 0;
 
-  if(called) {
-    traceEvent(TRACE_NORMAL, "Ok I am leaving now");
-    _exit(0);
-  } else {
-    traceEvent(TRACE_NORMAL, "Shutting down...");
-    called = 1;
-  }
+    if(called) {
+        traceEvent(TRACE_NORMAL, "Ok I am leaving now");
+        _exit(0);
+    } else {
+        traceEvent(TRACE_NORMAL, "Shutting down...");
+        called = 1;
+    }
 
-  keep_running = 0;
+    keep_running = 0;
 #ifdef WIN32
-  return(TRUE);
+    return(TRUE);
 #endif
 }
 #endif /* defined(__linux__) || defined(WIN32) */
@@ -1040,173 +725,154 @@ static void term_handler(int sig)
 /* *************************************************** */
 
 /** Main program entry point from kernel. */
-int main(int argc, char * const argv[]) {
-  int rc;
+int main (int argc, char * const argv[]) {
 
-  init_sn(&sss_node);
+    int rc;
+#ifndef WIN32
+    struct passwd *pw = NULL;
+#endif
+    struct peer_info *scan, *tmp;
+    struct sn_community *comm, *tmp_comm;
+    sn_user_t *user, *tmp_user;
 
-  if((argc >= 2) && (argv[1][0] != '-')) {
-    rc = loadFromFile(argv[1], &sss_node);
-    if(argc > 2)
-      rc = loadFromCLI(argc, argv, &sss_node);
-  } else if(argc > 1)
-    rc = loadFromCLI(argc, argv, &sss_node);
-  else
+
+    sn_init(&sss_node);
+    add_federation_to_communities(&sss_node);
+
+    if((argc >= 2) && (argv[1][0] != '-')) {
+        rc = loadFromFile(argv[1], &sss_node);
+        if(argc > 2) {
+            rc = loadFromCLI(argc, argv, &sss_node);
+        }
+    } else if(argc > 1) {
+        rc = loadFromCLI(argc, argv, &sss_node);
+    } else
+
 #ifdef WIN32
-    /* Load from current directory */
-    rc = loadFromFile("supernode.conf", &sss_node);
+        // load from current directory
+        rc = loadFromFile("supernode.conf", &sss_node);
 #else
-    rc = -1;
+        rc = -1;
 #endif
 
-  if(rc < 0)
-    help();
+    if(rc < 0) {
+        help(1); /* short help */
+    }
+
+    if(sss_node.community_file)
+        load_allowed_sn_community(&sss_node);
 
 #if defined(N2N_HAVE_DAEMON)
-  if(sss_node.daemon) {
-    useSyslog=1; /* traceEvent output now goes to syslog. */
+    if(sss_node.daemon) {
+        setUseSyslog(1); /* traceEvent output now goes to syslog. */
 
-    if(-1 == daemon(0, 0)) {
-      traceEvent(TRACE_ERROR, "Failed to become daemon.");
-      exit(-5);
+        if(-1 == daemon(0, 0)) {
+            traceEvent(TRACE_ERROR, "Failed to become daemon.");
+            exit(-5);
+        }
     }
-  }
 #endif /* #if defined(N2N_HAVE_DAEMON) */
 
-#ifndef WIN32
-  if((getuid() == 0) || (getgid() == 0))
-    traceEvent(TRACE_WARNING, "Running as root is discouraged");
+    // warn on default federation name
+    if(!strcmp(sss_node.federation->community, FEDERATION_NAME)) {
+        traceEvent(TRACE_WARNING, "Using default federation name. FOR TESTING ONLY, usage of a custom federation name (-F) is highly recommended!");
+    }
+
+    // generate shared secrets for user authentication; can be done only after
+    // federation name is known (-F) and community list completely read (-c)
+    traceEvent(TRACE_INFO, "started shared secrets calculation for edge authentication");
+    generate_private_key(sss_node.private_key, sss_node.federation->community + 1); /* skip '*' federation leading character */
+    HASH_ITER(hh, sss_node.communities, comm, tmp_comm) {
+        if(comm->is_federation) {
+            continue;
+        }
+        HASH_ITER(hh, comm->allowed_users, user, tmp_user) {
+            // calculate common shared secret (ECDH)
+            generate_shared_secret(user->shared_secret, sss_node.private_key, user->public_key);
+            // prepare for use as key
+            user->shared_secret_ctx = (he_context_t*)calloc(1, sizeof(speck_context_t));
+            speck_init((speck_context_t**)&user->shared_secret_ctx, user->shared_secret, 128);
+        }
+    }
+    traceEvent(TRACE_NORMAL, "calculated shared secrets for edge authentication");
+
+
+    traceEvent(TRACE_DEBUG, "traceLevel is %d", getTraceLevel());
+
+    sss_node.sock = open_socket(sss_node.lport, 1 /*bind ANY*/, 0 /* UDP */);
+    if(-1 == sss_node.sock) {
+        traceEvent(TRACE_ERROR, "Failed to open main socket. %s", strerror(errno));
+        exit(-2);
+    } else {
+        traceEvent(TRACE_NORMAL, "supernode is listening on UDP %u (main)", sss_node.lport);
+    }
+
+#ifdef N2N_HAVE_TCP
+    sss_node.tcp_sock = open_socket(sss_node.lport, 1 /*bind ANY*/, 1 /* TCP */);
+    if(-1 == sss_node.tcp_sock) {
+        traceEvent(TRACE_ERROR, "Failed to open auxiliary TCP socket. %s", strerror(errno));
+        exit(-2);
+    } else {
+        traceEvent(TRACE_NORMAL, "supernode opened TCP %u (aux)", sss_node.lport);
+    }
+
+    if(-1 == listen(sss_node.tcp_sock, N2N_TCP_BACKLOG_QUEUE_SIZE)) {
+        traceEvent(TRACE_ERROR, "Failed to listen on auxiliary TCP socket. %s", strerror(errno));
+        exit(-2);
+    } else {
+        traceEvent(TRACE_NORMAL, "supernode is listening on TCP %u (aux)", sss_node.lport);
+    }
 #endif
 
-  traceEvent(TRACE_DEBUG, "traceLevel is %d", getTraceLevel());
+    sss_node.mgmt_sock = open_socket(sss_node.mport, 0 /* bind LOOPBACK */, 0 /* UDP */);
+    if(-1 == sss_node.mgmt_sock) {
+        traceEvent(TRACE_ERROR, "Failed to open management socket. %s", strerror(errno));
+        exit(-2);
+    } else {
+        traceEvent(TRACE_NORMAL, "supernode is listening on UDP %u (management)", sss_node.mport);
+    }
 
-  sss_node.sock = open_socket(sss_node.lport, 1 /*bind ANY*/);
-  if(-1 == sss_node.sock) {
-    traceEvent(TRACE_ERROR, "Failed to open main socket. %s", strerror(errno));
-    exit(-2);
-  } else {
-    traceEvent(TRACE_NORMAL, "supernode is listening on UDP %u (main)", sss_node.lport);
-  }
+    HASH_ITER(hh, sss_node.federation->edges, scan, tmp)
+        scan->socket_fd = sss_node.sock;
 
-  sss_node.mgmt_sock = open_socket(N2N_SN_MGMT_PORT, 0 /* bind LOOPBACK */);
-  if(-1 == sss_node.mgmt_sock) {
-    traceEvent(TRACE_ERROR, "Failed to open management socket. %s", strerror(errno));
-    exit(-2);
-  } else
-    traceEvent(TRACE_NORMAL, "supernode is listening on UDP %u (management)", N2N_SN_MGMT_PORT);
+#ifndef WIN32
+    if(((pw = getpwnam ("n2n")) != NULL) || ((pw = getpwnam ("nobody")) != NULL)) {
+        sss_node.userid = sss_node.userid == 0 ? pw->pw_uid : 0;
+        sss_node.groupid = sss_node.groupid == 0 ? pw->pw_gid : 0;
+    }
+    if((sss_node.userid != 0) || (sss_node.groupid != 0)) {
+        traceEvent(TRACE_NORMAL, "Dropping privileges to uid=%d, gid=%d",
+	                 (signed int)sss_node.userid, (signed int)sss_node.groupid);
 
-  traceEvent(TRACE_NORMAL, "supernode started");
+        /* Finished with the need for root privileges. Drop to unprivileged user. */
+        if((setgid(sss_node.groupid) != 0)
+           || (setuid(sss_node.userid) != 0)) {
+            traceEvent(TRACE_ERROR, "Unable to drop privileges [%u/%s]", errno, strerror(errno));
+            exit(1);
+        }
+    }
+
+    if((getuid() == 0) || (getgid() == 0)) {
+        traceEvent(TRACE_WARNING, "Running as root is discouraged, check out the -u/-g options");
+    }
+#endif
+
+    if(resolve_create_thread(&(sss_node.resolve_parameter), sss_node.federation->edges) == 0) {
+         traceEvent(TRACE_NORMAL, "Successfully created resolver thread");
+    }
+
+    traceEvent(TRACE_NORMAL, "supernode started");
 
 #ifdef __linux__
-  signal(SIGTERM, term_handler);
-  signal(SIGINT, term_handler);
-  signal(SIGHUP, dump_registrations);
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGTERM, term_handler);
+    signal(SIGINT,  term_handler);
+    signal(SIGHUP,  dump_registrations);
 #endif
 #ifdef WIN32
-  SetConsoleCtrlHandler(term_handler, TRUE);
+    SetConsoleCtrlHandler(term_handler, TRUE);
 #endif
 
-  keep_running = 1;
-  return run_loop(&sss_node);
-}
-
-
-/** Long lived processing entry point. Split out from main to simply
- *  daemonisation on some platforms. */
-static int run_loop(n2n_sn_t * sss) {
-  uint8_t pktbuf[N2N_SN_PKTBUF_SIZE];
-  time_t last_purge_edges = 0;
-  struct sn_community *comm, *tmp;
-
-  sss->start_time = time(NULL);
-
-  while(keep_running) {
-    int rc;
-    ssize_t bread;
-    int max_sock;
-    fd_set socket_mask;
-    struct timeval wait_time;
-    time_t now=0;
-
-    FD_ZERO(&socket_mask);
-    max_sock = MAX(sss->sock, sss->mgmt_sock);
-
-    FD_SET(sss->sock, &socket_mask);
-    FD_SET(sss->mgmt_sock, &socket_mask);
-
-    wait_time.tv_sec = 10; wait_time.tv_usec = 0;
-    rc = select(max_sock+1, &socket_mask, NULL, NULL, &wait_time);
-
-    now = time(NULL);
-
-    if(rc > 0) {
-      if(FD_ISSET(sss->sock, &socket_mask)) {
-	struct sockaddr_in  sender_sock;
-	socklen_t           i;
-
-	i = sizeof(sender_sock);
-	bread = recvfrom(sss->sock, pktbuf, N2N_SN_PKTBUF_SIZE, 0/*flags*/,
-			 (struct sockaddr *)&sender_sock, (socklen_t*)&i);
-
-	if((bread < 0)
-#ifdef WIN32
-	   && (WSAGetLastError() != WSAECONNRESET)
-#endif
-	) {
-	  /* For UDP bread of zero just means no data (unlike TCP). */
-	  /* The fd is no good now. Maybe we lost our interface. */
-	  traceEvent(TRACE_ERROR, "recvfrom() failed %d errno %d (%s)", bread, errno, strerror(errno));
-#ifdef WIN32
-	  traceEvent(TRACE_ERROR, "WSAGetLastError(): %u", WSAGetLastError());
-#endif
-	  keep_running=0;
-	  break;
-	}
-
-	/* We have a datagram to process */
-	if(bread > 0) {
-	  /* And the datagram has data (not just a header) */
-	  process_udp(sss, &sender_sock, pktbuf, bread, now);
-	}
-      }
-
-      if(FD_ISSET(sss->mgmt_sock, &socket_mask)) {
-	struct sockaddr_in  sender_sock;
-	size_t              i;
-
-	i = sizeof(sender_sock);
-	bread = recvfrom(sss->mgmt_sock, pktbuf, N2N_SN_PKTBUF_SIZE, 0/*flags*/,
-			 (struct sockaddr *)&sender_sock, (socklen_t*)&i);
-
-	if(bread <= 0) {
-	  traceEvent(TRACE_ERROR, "recvfrom() failed %d errno %d (%s)", bread, errno, strerror(errno));
-	  keep_running=0;
-	  break;
-	}
-
-	/* We have a datagram to process */
-	process_mgmt(sss, &sender_sock, pktbuf, bread, now);
-      }
-    } else {
-      traceEvent(TRACE_DEBUG, "timeout");
-    }
-
-    HASH_ITER(hh, sss->communities, comm, tmp) {
-      purge_expired_registrations( &comm->edges, &last_purge_edges );
-
-      if((comm->edges == NULL) && (!sss->lock_communities)) {
-	traceEvent(TRACE_INFO, "Purging idle community %s", comm->community);
-	if (NULL != comm->header_encryption_ctx)
-          /* this should not happen as no 'locked' and thus only communities w/o encrypted header here */
-	  free (comm->header_encryption_ctx);
-	HASH_DEL(sss->communities, comm);
-	free(comm);
-      }
-    }
-
-  } /* while */
-
-  deinit_sn(sss);
-
-  return 0;
+    keep_running = 1;
+    return run_sn_loop(&sss_node, &keep_running);
 }

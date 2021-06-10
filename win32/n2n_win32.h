@@ -11,6 +11,8 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
+#define WIN32_LEAN_AND_MEAN
+
 #if defined(__MINGW32__)
 /* should be defined here and before winsock gets included */
 #ifndef _WIN32_WINNT
@@ -26,26 +28,6 @@
 
 #include "wintap.h"
 
-#ifdef _MSC_VER
-#include "getopt.h"
-
-/* Other Win environments are expected to support stdint.h */
-
-/* stdint.h typedefs (C99) (not present in Visual Studio) */
-typedef unsigned int uint32_t;
-typedef unsigned short uint16_t;
-typedef unsigned char uint8_t;
-
-/* sys/types.h typedefs (not present in Visual Studio) */
-typedef unsigned int u_int32_t;
-typedef unsigned short u_int16_t;
-typedef unsigned char u_int8_t;
-
-typedef int ssize_t;
-#endif /* #ifdef _MSC_VER */
-
-typedef unsigned long in_addr_t;
-
 #undef EAFNOSUPPORT
 #define EAFNOSUPPORT   WSAEAFNOSUPPORT 
 #define MAX(a,b) (a > b ? a : b)
@@ -56,18 +38,6 @@ typedef unsigned long in_addr_t;
 
 #define socklen_t int
 
-#define ETH_ADDR_LEN 6
-/*                                                                                                                                                                                     
- * Structure of a 10Mb/s Ethernet header.                                                                                                                                              
- */
-struct ether_hdr
-{
-    uint8_t  dhost[ETH_ADDR_LEN];
-    uint8_t  shost[ETH_ADDR_LEN];
-    uint16_t type;                /* higher layer protocol encapsulated */
-};
-
-typedef struct ether_hdr ether_hdr_t;
 
 /* ************************************* */
 
@@ -95,17 +65,57 @@ struct ip {
 
 /* ************************************* */
 
+
 typedef struct tuntap_dev {
-	HANDLE device_handle;
-	char *device_name;
-	char *ifName;
-	OVERLAPPED overlap_read, overlap_write;
-	uint8_t      mac_addr[6];
-	uint32_t     ip_addr, device_mask;
-	unsigned int mtu;
+	HANDLE          device_handle;
+	char            *device_name;
+	char            *ifName;
+	OVERLAPPED      overlap_read, overlap_write;
+	n2n_mac_t       mac_addr;
+	uint32_t        ip_addr;
+	uint32_t        device_mask;
+	unsigned int    mtu;
+	unsigned int    metric;
 } tuntap_dev;
 
+
+/* ************************************* */
+
+
 #define index(a, b) strchr(a, b)
+#define sleep(x) Sleep(x * 1000)
+
+
+/* ************************************* */
+
+
+#define HAVE_PTHREAD
+#define pthread_t       HANDLE
+#define pthread_mutex_t HANDLE
+
+#define pthread_create(p_thread_handle, attr, thread_func, p_param)                         \
+    (*p_thread_handle = CreateThread(0 /* default security flags */, 0 /*default stack*/,   \
+                 thread_func, p_param, 0 /* default creation flags */,                      \
+                 NULL) == 0)
+
+#define pthread_cancel(p_thread_handle) \
+    TerminateThread(p_thread_handle, 0)
+
+#define pthread_mutex_init(p_mutex_handle, attr)                      \
+     *p_mutex_handle = CreateMutex(NULL /*default security flags */,  \
+     FALSE /* initially not owned */, NULL /* unnamed */)
+
+#define pthread_mutex_lock(mutex)         \
+    WaitForSingleObject(*mutex, INFINITE)
+
+#define pthread_mutex_trylock(mutex)  \
+    WaitForSingleObject(*mutex, NULL)
+
+#define pthread_mutex_unlock(mutex) \
+    ReleaseMutex(*mutex)
+
+
+/* ************************************* */
 
 
 #endif
